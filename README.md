@@ -89,6 +89,18 @@ Settings come from the environment, or from a `.env` file next to `auth.py` (ign
 
 To try the HTTP server locally, run it and connect the [MCP Inspector](https://github.com/modelcontextprotocol/inspector) (`npx @modelcontextprotocol/inspector`) to `http://127.0.0.1:8765/mcp` with Streamable HTTP. It goes through the same GitHub login.
 
+## Deployment
+
+On my server the HTTP server runs as a systemd service ([`deploy/garmin-mcp.service`](deploy/garmin-mcp.service)): its own system user, code owned by root, the token database in `/var/lib/garmin-mcp`, listening on `127.0.0.1:8765` only. Tailscale Funnel publishes it on the internet over HTTPS; nothing else on the machine is public. Settings are in a root-only environment file.
+
+Things I learned on the way:
+
+- claude.ai calls connectors from Anthropic's cloud, also from the phone app, so the server has to be public. A Tailscale-only address cannot work.
+- With Funnel on port 8443 the endpoint answered from the internet, but no request from claude.ai ever arrived. On port 443 it connected. Funnel allows only 443, 8443 and 10000, so the server's other page moved off 443.
+- Right after Funnel is switched on, the public relays take a minute or two before every one of them answers. A connect attempt in that window fails part way through the OAuth discovery.
+- Behind a proxy the `Host` header is the public name. The SDK's DNS rebinding protection refuses unknown hosts with `421`, so the server allows the host from `PUBLIC_URL`.
+- In the connector dialog, choose "Register automatically" (dynamic client registration). The recommended "published identity" option needs CIMD support on the server.
+
 ## Status
 
 | Part | State |
@@ -96,6 +108,8 @@ To try the HTTP server locally, run it and connect the [MCP Inspector](https://g
 | Tools over stdio, used from Claude Code | Done |
 | Streamable HTTP, checked with the MCP Inspector | Done |
 | OAuth with GitHub login, checked end to end with the Inspector | Done |
-| Running on my server behind Tailscale Funnel, as a claude.ai custom connector | To do |
+| Running on my server behind Tailscale Funnel, as a claude.ai custom connector | Done, used from claude.ai on the web and the phone |
+| Refusing a second GitHub account, checked for real | To do |
+| Client ID metadata documents (CIMD), claude.ai's recommended client option | Not supported; the connector uses dynamic registration |
 
 Built with the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) 2.3.0 and DuckDB 1.5.6.
