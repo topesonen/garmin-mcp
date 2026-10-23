@@ -1,0 +1,38 @@
+# The MCP server over Streamable HTTP, as a systemd service on the server.
+# Listens on 127.0.0.1 only; Tailscale Funnel publishes it on port 8443.
+# Install: copy to /etc/systemd/system/, then `systemctl enable --now garmin-mcp`.
+
+[Unit]
+Description=Garmin MCP server (Streamable HTTP with OAuth)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# In group garmin, which can read the warehouse and garmin-llm's docs.
+User=garmin-mcp
+Group=garmin-mcp
+SupplementaryGroups=garmin
+WorkingDirectory=/opt/garmin-mcp
+# GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_ALLOWED_USER, PUBLIC_URL,
+# TOKEN_DB, GARMIN_DB, GARMIN_SCHEMA_DOC; readable by root only. systemd
+# reads it before switching to the garmin-mcp user.
+EnvironmentFile=/etc/garmin-mcp.env
+ExecStart=/opt/garmin-mcp/.venv/bin/python server.py --http --port 8765
+Restart=on-failure
+RestartSec=5
+
+# The server reads its code, the warehouse and the schema doc, and writes
+# only its token database in /var/lib/garmin-mcp.
+StateDirectory=garmin-mcp
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

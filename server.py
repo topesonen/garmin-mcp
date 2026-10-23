@@ -19,11 +19,13 @@ import datetime
 import decimal
 import os
 import threading
+import urllib.parse
 from pathlib import Path
 
 import duckdb
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 HERE = Path(__file__).resolve().parent
@@ -142,8 +144,29 @@ if __name__ == "__main__":
         provider, settings = auth.from_env()
         server = create_server(provider, settings)
         server.custom_route("/github/callback", methods=["GET"])(provider.github_callback)
+        # The SDK refuses requests whose Host or Origin header it does not know
+        # (DNS rebinding protection). Behind a proxy the Host is the public name.
+        public = urllib.parse.urlsplit(provider.public_url)
+        security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["127.0.0.1:*", "localhost:*", public.netloc, public.hostname],
+            allowed_origins=[
+                "http://127.0.0.1:*",
+                "http://localhost:*",
+                f"{public.scheme}://{public.netloc}",
+                "https://claude.ai",
+                "https://claude.com",
+            ],
+        )
         # Stateless with plain JSON replies: every tool call is one request and
         # one response, so the server keeps no sessions between calls.
-        server.run("streamable-http", host="127.0.0.1", port=args.port, stateless_http=True, json_response=True)
+        server.run(
+            "streamable-http",
+            host="127.0.0.1",
+            port=args.port,
+            stateless_http=True,
+            json_response=True,
+            transport_security=security,
+        )
     else:
         create_server().run()
