@@ -10,7 +10,8 @@ Settings, from the environment:
 Usage:
     python server.py                    stdio, for Claude Code:
                                         claude mcp add garmin -- /path/to/.venv/bin/python /path/to/server.py
-    python server.py --http [--port N]  Streamable HTTP on 127.0.0.1, endpoint /mcp
+    python server.py --http [--port N]  Streamable HTTP on 127.0.0.1, endpoint /mcp,
+                                        with OAuth (GitHub login, see auth.py)
 """
 
 import argparse
@@ -35,13 +36,10 @@ TIMEOUT_S = 10
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
 
-server = MCPServer(
-    name="garmin",
-    instructions=(
-        "Training data from Garmin Connect, one row per activity in the `activities` table. "
-        "Call get_notes once before writing queries: it gives units and meanings "
-        "(pace is in seconds per km, durations in seconds). Query only `activities`."
-    ),
+INSTRUCTIONS = (
+    "Training data from Garmin Connect, one row per activity in the `activities` table. "
+    "Call get_notes once before writing queries: it gives units and meanings "
+    "(pace is in seconds per km, durations in seconds). Query only `activities`."
 )
 
 
@@ -62,7 +60,6 @@ def to_json_value(value):
     return value
 
 
-@server.tool(annotations=READ_ONLY)
 def get_schema() -> dict:
     """Columns and types of the activities table, read from the database itself."""
     con = connect()
@@ -86,13 +83,11 @@ def get_schema() -> dict:
     }
 
 
-@server.tool(annotations=READ_ONLY)
 def get_notes() -> str:
     """Units, meaning of each column and tips for writing queries (garmin-llm's schema doc)."""
     return SCHEMA_DOC.read_text()
 
 
-@server.tool(annotations=READ_ONLY)
 def run_query(sql: str, limit: int = DEFAULT_LIMIT) -> dict:
     """Run one read-only DuckDB SQL query on the activities table.
 
@@ -126,14 +121,29 @@ def run_query(sql: str, limit: int = DEFAULT_LIMIT) -> dict:
     }
 
 
+def create_server(auth_provider=None, auth_settings=None):
+    server = MCPServer(
+        name="garmin", instructions=INSTRUCTIONS, auth_server_provider=auth_provider, auth=auth_settings
+    )
+    for tool in (get_schema, get_notes, run_query):
+        server.add_tool(tool, annotations=READ_ONLY)
+    return server
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--http", action="store_true", help="serve Streamable HTTP instead of stdio")
+    parser.add_argument("--http", action="store_true", help="serve Streamable HTTP with OAuth instead of stdio")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     if args.http:
+        # Imported here so stdio mode needs no OAuth settings.
+        import auth
+
+        provider, settings = auth.from_env()
+        server = create_server(provider, settings)
+        server.custom_route("/github/callback", methods=["GET"])(provider.github_callback)
         # Stateless with plain JSON replies: every tool call is one request and
         # one response, so the server keeps no sessions between calls.
         server.run("streamable-http", host="127.0.0.1", port=args.port, stateless_http=True, json_response=True)
     else:
-        server.run()
+        create_server().run()
