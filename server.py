@@ -1,11 +1,19 @@
-"""MCP server for the Garmin training warehouse built by garmin-llm.
+"""MCP server for the Garmin training warehouse built by garmin-llm, and for
+the Garmin Connect Personal API itself.
 
-Gives Claude three read-only tools: the live table schema, the schema notes
-(units, meanings, query tips) and a SQL query with a row limit and a timeout.
+Warehouse tools: the live table schema, the schema notes (units, meanings,
+query tips) and a SQL query with a row limit and a timeout, over the
+`activities` and `daily_summaries` tables.
+
+Live tools (garmin_live.py): one per Personal API endpoint, for detail the
+warehouse does not hold: splits, FIT records, sleep stages, intraday heart
+rate, Body Battery events, weight, settings.
 
 Settings, from the environment:
     GARMIN_DB          path to garmin.duckdb (default ../garmin-llm/data/warehouse/garmin.duckdb)
     GARMIN_SCHEMA_DOC  path to garmin-llm's docs/schema.md (default ../garmin-llm/docs/schema.md)
+    GARMIN_DAILY_DOC   path to garmin-llm's docs/schema_daily.md (default next to GARMIN_SCHEMA_DOC)
+    GARMIN_API_KEY     Personal API key for the live tools (see garmin_live.py)
 
 Usage:
     python server.py                    stdio, for Claude Code:
@@ -23,6 +31,7 @@ import urllib.parse
 from pathlib import Path
 
 import duckdb
+import garmin_live
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
@@ -31,17 +40,31 @@ from mcp.types import ToolAnnotations
 HERE = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("GARMIN_DB", HERE.parent / "garmin-llm/data/warehouse/garmin.duckdb"))
 SCHEMA_DOC = Path(os.environ.get("GARMIN_SCHEMA_DOC", HERE.parent / "garmin-llm/docs/schema.md"))
-TABLE = "activities"
+DAILY_DOC = Path(os.environ.get("GARMIN_DAILY_DOC", SCHEMA_DOC.with_name("schema_daily.md")))
+# Table -> its date column, for the date range in get_schema.
+TABLES = {"activities": "start_time_local", "daily_summaries": "calendar_date"}
 DEFAULT_LIMIT = 200
 MAX_LIMIT = 2000
 TIMEOUT_S = 10
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
+# The live tools read from Garmin, outside this server.
+LIVE = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True)
 
 INSTRUCTIONS = (
-    "Training data from Garmin Connect, one row per activity in the `activities` table. "
-    "Call get_notes once before writing queries: it gives units and meanings "
-    "(pace is in seconds per km, durations in seconds). Query only `activities`."
+    "The user's Garmin training and health data, for coaching. Two sources:\n"
+    "1. A warehouse synced hourly, queried with run_query (DuckDB SQL): `activities` "
+    "(one row per workout) and `daily_summaries` (one row per day: steps, resting HR, "
+    "stress, Body Battery, and the night's sleep and HRV). Call get_notes once before "
+    "writing queries: it gives units and meanings (pace in seconds per km, durations in "
+    "seconds). Use it for history, trends, weekly totals and comparisons.\n"
+    "2. Live tools (get_*, search_activities) that call Garmin Connect directly, for "
+    "detail the warehouse lacks: an activity's splits (get_activity), its second-by-second "
+    "record (get_activity_fit), sleep stages and score factors (get_sleep), intraday heart "
+    "rate, Body Battery events, HR zones, weight. They return Garmin's own JSON and units. "
+    "Warehouse activity_id is not Garmin's activityId; use search_activities with a date "
+    "to find the Garmin id. Garmin rate limits the key, so prefer the warehouse for "
+    "anything it covers and avoid calling live tools in long loops."
 )
 
 
@@ -63,35 +86,46 @@ def to_json_value(value):
 
 
 def get_schema() -> dict:
-    """Columns and types of the activities table, read from the database itself."""
+    """Columns and types of the warehouse tables (activities, daily_summaries), read from
+    the database itself, with row counts and date ranges."""
     con = connect()
+    tables = []
     try:
-        columns = con.execute(
-            "SELECT column_name, data_type FROM information_schema.columns "
-            "WHERE table_name = ? ORDER BY ordinal_position",
-            [TABLE],
-        ).fetchall()
-        n_rows, first, last = con.execute(
-            f"SELECT count(*), min(start_time_local), max(start_time_local) FROM {TABLE}"
-        ).fetchone()
+        present = {row[0] for row in con.execute("SELECT table_name FROM information_schema.tables").fetchall()}
+        for table, date_column in TABLES.items():
+            if table not in present:
+                continue
+            columns = con.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name = ? ORDER BY ordinal_position",
+                [table],
+            ).fetchall()
+            n_rows, first, last = con.execute(
+                f"SELECT count(*), min({date_column}), max({date_column}) FROM {table}"
+            ).fetchone()
+            tables.append({
+                "table": table,
+                "columns": [{"name": name, "type": data_type} for name, data_type in columns],
+                "rows": n_rows,
+                "first": to_json_value(first),
+                "last": to_json_value(last),
+            })
     finally:
         con.close()
-    return {
-        "table": TABLE,
-        "columns": [{"name": name, "type": data_type} for name, data_type in columns],
-        "rows": n_rows,
-        "first_activity": to_json_value(first),
-        "last_activity": to_json_value(last),
-    }
+    return {"tables": tables}
 
 
 def get_notes() -> str:
-    """Units, meaning of each column and tips for writing queries (garmin-llm's schema doc)."""
-    return SCHEMA_DOC.read_text()
+    """Units, meaning of each column and tips for writing queries, for both tables
+    (garmin-llm's schema docs)."""
+    notes = SCHEMA_DOC.read_text()
+    if DAILY_DOC.exists():
+        notes += "\n\n" + DAILY_DOC.read_text()
+    return notes
 
 
 def run_query(sql: str, limit: int = DEFAULT_LIMIT) -> dict:
-    """Run one read-only DuckDB SQL query on the activities table.
+    """Run one read-only DuckDB SQL query on the warehouse (activities, daily_summaries).
 
     Returns the column names and up to `limit` rows (at most 2000).
     `truncated` is true when the result had more rows than that.
@@ -129,6 +163,8 @@ def create_server(auth_provider=None, auth_settings=None):
     )
     for tool in (get_schema, get_notes, run_query):
         server.add_tool(tool, annotations=READ_ONLY)
+    for tool in garmin_live.TOOLS:
+        server.add_tool(tool, annotations=LIVE)
     return server
 
 
